@@ -2,11 +2,12 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using System.ComponentModel;
 using System.Data;
+using System.Text.Json;
 
 namespace WebApplication1.Controllers
 {
     [ApiController]
-    [Route("api/myofficeacpd")] // 需求 2：資源導向 URL 設計，全小寫名詞
+    [Route("api/myofficeacpd")]
     public class MyOfficeAcpdController : ControllerBase
     {
         private readonly ILogger<MyOfficeAcpdController> _logger;
@@ -19,6 +20,39 @@ namespace WebApplication1.Controllers
                               ?? throw new InvalidOperationException("找不到資料庫連線字串");
         }
 
+        // ==========================================
+        //  共用方法：寫入資料庫 Log
+        // ==========================================
+        private async Task WriteLogAsync(Guid groupId, string actionName, object? actionData, SqlConnection connection)
+        {
+            try
+            {
+                using (var cmdLog = new SqlCommand("[dbo].[usp_AddLog]", connection))
+                {
+                    cmdLog.CommandType = CommandType.StoredProcedure;
+                    cmdLog.Parameters.AddWithValue("@_InBox_ReadID", 0);
+                    cmdLog.Parameters.AddWithValue("@_InBox_SPNAME", "MyOfficeAcpdController");
+                    cmdLog.Parameters.AddWithValue("@_InBox_GroupID", groupId);
+                    cmdLog.Parameters.AddWithValue("@_InBox_ExProgram", actionName);
+
+                    string jsonInfo = actionData != null ? JsonSerializer.Serialize(actionData) : "{}";
+                    cmdLog.Parameters.AddWithValue("@_InBox_ActionJSON", jsonInfo);
+
+                    var returnValuesParam = new SqlParameter { ParameterName = "@_OutBox_ReturnValues", SqlDbType = SqlDbType.NVarChar, Size = -1, Direction = ParameterDirection.Output };
+                    cmdLog.Parameters.Add(returnValuesParam);
+
+                    await cmdLog.ExecuteNonQueryAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "寫入資料庫 Log 失敗");
+            }
+        }
+
+        // ==========================================
+        // 1. 查詢所有資料 (GET)
+        // ==========================================
         [HttpGet]
         public async Task<IActionResult> GetAll()
         {
@@ -28,10 +62,7 @@ namespace WebApplication1.Controllers
                 using (var connection = new SqlConnection(_connectionString))
                 {
                     await connection.OpenAsync();
-                    string querySql = @"
-                        SELECT [ACPD_SID], [ACPD_Cname], [ACPD_Ename], [ACPD_Email], [ACPD_Status]
-                        FROM [dbo].[MyOffice_ACPD]
-                        ORDER BY [ACPD_NowDateTime] DESC";
+                    string querySql = "SELECT [ACPD_SID], [ACPD_Cname], [ACPD_Ename], [ACPD_Email], [ACPD_Status] FROM [dbo].[MyOffice_ACPD] ORDER BY [ACPD_NowDateTime] DESC";
 
                     using (var cmd = new SqlCommand(querySql, connection))
                     using (var reader = await cmd.ExecuteReaderAsync())
@@ -49,30 +80,31 @@ namespace WebApplication1.Controllers
                         }
                     }
                 }
-                return Ok(accountList); // 需求 3：回傳 200 OK
+                return Ok(accountList);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "查詢列表失敗");
-                return StatusCode(500, new { Message = "伺服器內部錯誤" }); // 需求 3：回傳 500
+                return StatusCode(500, new { Message = "伺服器內部錯誤" });
             }
         }
 
+        // ==========================================
+        // 2. 查詢單筆資料 (GET) 
+        // (這就是 CS0103 報錯說找不到的那個方法！)
+        // ==========================================
         [HttpGet("{id}")]
         public async Task<IActionResult> GetById(string id)
         {
+            if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" });
+
             try
             {
-                if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" }); // 需求 3：回傳 400
-
                 AccountResponse? account = null;
                 using (var connection = new SqlConnection(_connectionString))
                 {
                     await connection.OpenAsync();
-                    string querySql = @"
-                        SELECT [ACPD_SID], [ACPD_Cname], [ACPD_Ename], [ACPD_Email], [ACPD_Status]
-                        FROM [dbo].[MyOffice_ACPD]
-                        WHERE [ACPD_SID] = @SID";
+                    string querySql = "SELECT [ACPD_SID], [ACPD_Cname], [ACPD_Ename], [ACPD_Email], [ACPD_Status] FROM [dbo].[MyOffice_ACPD] WHERE [ACPD_SID] = @SID";
 
                     using (var cmd = new SqlCommand(querySql, connection))
                     {
@@ -93,9 +125,8 @@ namespace WebApplication1.Controllers
                         }
                     }
                 }
-
-                if (account == null) return NotFound(new { Message = "資源不存在" }); // 需求 3：回傳 404
-                return Ok(account); // 需求 3：回傳 200 OK
+                if (account == null) return NotFound(new { Message = "資源不存在" });
+                return Ok(account);
             }
             catch (Exception ex)
             {
@@ -104,10 +135,15 @@ namespace WebApplication1.Controllers
             }
         }
 
+        // ==========================================
+        // 3. 新增資料 (POST) - 結合自動 Log 機制
+        // ==========================================
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] CreateAccountRequest request)
         {
-            if (!ModelState.IsValid) return BadRequest(ModelState); // 需求 3：回傳 400 Bad Request
+            if (!ModelState.IsValid) return BadRequest(ModelState);
+
+            Guid currentGroupId = Guid.NewGuid(); // 產生此次交易的專屬追蹤碼
 
             try
             {
@@ -115,6 +151,8 @@ namespace WebApplication1.Controllers
                 using (var connection = new SqlConnection(_connectionString))
                 {
                     await connection.OpenAsync();
+
+                    await WriteLogAsync(currentGroupId, "1. 開始建立帳號", request, connection);
 
                     // 呼叫預存程序產生 SID
                     using (var cmdSid = new SqlCommand("[dbo].[NEWSID]", connection))
@@ -127,7 +165,13 @@ namespace WebApplication1.Controllers
                         newSid = returnSidParam.Value?.ToString() ?? "";
                     }
 
-                    if (string.IsNullOrEmpty(newSid)) return StatusCode(500, new { Message = "無法產生 SID" });
+                    if (string.IsNullOrEmpty(newSid))
+                    {
+                        await WriteLogAsync(currentGroupId, "Error: SID 產生失敗", null, connection);
+                        return StatusCode(500, new { Message = "無法產生 SID" });
+                    }
+
+                    await WriteLogAsync(currentGroupId, "2. SID 產生成功", new { GeneratedSID = newSid }, connection);
 
                     // 新增資料
                     string insertSql = @"
@@ -148,22 +192,31 @@ namespace WebApplication1.Controllers
 
                         await cmdInsert.ExecuteNonQueryAsync();
                     }
+
+                    await WriteLogAsync(currentGroupId, "3. 帳號建立完成", new { FinalSID = newSid }, connection);
                 }
 
-                // 需求 3：回傳 201 Created，並附上新資源的 URI 網址與資料
                 return CreatedAtAction(nameof(GetById), new { id = newSid }, new { Message = "建立成功", SID = newSid });
             }
             catch (Exception ex)
             {
+                using (var errorConn = new SqlConnection(_connectionString))
+                {
+                    await errorConn.OpenAsync();
+                    await WriteLogAsync(currentGroupId, "Error: 發生例外狀況", new { ErrorMessage = ex.Message }, errorConn);
+                }
                 _logger.LogError(ex, "新增資料失敗");
                 return StatusCode(500, new { Message = "伺服器內部錯誤" });
             }
         }
 
+        // ==========================================
+        // 4. 更新資料 (PUT)
+        // ==========================================
         [HttpPut("{id}")]
         public async Task<IActionResult> Update(string id, [FromBody] UpdateAccountRequest request)
         {
-            if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" }); // 需求 3：回傳 400
+            if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" });
 
             try
             {
@@ -172,12 +225,8 @@ namespace WebApplication1.Controllers
                     await connection.OpenAsync();
                     string updateSql = @"
                         UPDATE [dbo].[MyOffice_ACPD] 
-                        SET [ACPD_Cname] = @Cname, 
-                            [ACPD_Ename] = @Ename, 
-                            [ACPD_Email] = @Email, 
-                            [ACPD_Status] = @Status,
-                            [ACPD_UPDDateTime] = GETDATE(),
-                            [ACPD_UPDID] = 'SystemAPI'
+                        SET [ACPD_Cname] = @Cname, [ACPD_Ename] = @Ename, [ACPD_Email] = @Email, [ACPD_Status] = @Status,
+                            [ACPD_UPDDateTime] = GETDATE(), [ACPD_UPDID] = 'SystemAPI'
                         WHERE [ACPD_SID] = @SID";
 
                     using (var cmd = new SqlCommand(updateSql, connection))
@@ -189,11 +238,10 @@ namespace WebApplication1.Controllers
                         cmd.Parameters.AddWithValue("@Status", request.Status ?? (object)DBNull.Value);
 
                         int rowsAffected = await cmd.ExecuteNonQueryAsync();
-
-                        if (rowsAffected == 0) return NotFound(new { Message = "資源不存在" }); // 需求 3：回傳 404
+                        if (rowsAffected == 0) return NotFound(new { Message = "資源不存在" });
                     }
                 }
-                return Ok(new { Message = "更新成功" }); // 回傳 200 OK
+                return Ok(new { Message = "更新成功" });
             }
             catch (Exception ex)
             {
@@ -202,10 +250,13 @@ namespace WebApplication1.Controllers
             }
         }
 
+        // ==========================================
+        // 5. 刪除資料 (DELETE)
+        // ==========================================
         [HttpDelete("{id}")]
         public async Task<IActionResult> Delete(string id)
         {
-            if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" }); // 需求 3：回傳 400
+            if (string.IsNullOrWhiteSpace(id)) return BadRequest(new { Message = "ID 不可為空" });
 
             try
             {
@@ -218,11 +269,9 @@ namespace WebApplication1.Controllers
                     {
                         cmd.Parameters.AddWithValue("@SID", id);
                         int rowsAffected = await cmd.ExecuteNonQueryAsync();
-
-                        if (rowsAffected == 0) return NotFound(new { Message = "資源不存在" }); // 需求 3：回傳 404
+                        if (rowsAffected == 0) return NotFound(new { Message = "資源不存在" });
                     }
                 }
-                // 需求 3：請求成功但無回傳內容，回傳 204 No Content
                 return NoContent();
             }
             catch (Exception ex)
